@@ -596,7 +596,7 @@ class SubtitleRemover:
         self.video_temp_file = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
         # 创建视频写对象
         self.video_writer = cv2.VideoWriter(self.video_temp_file.name, cv2.VideoWriter_fourcc(*'mp4v'), self.fps, self.size)
-        self.video_out_name = os.path.join(os.path.dirname(self.video_path), f'{self.vd_name}_no_sub.mp4')
+        self.video_out_name = os.path.join(os.path.dirname(self.video_path), f'{self.vd_name}_no_sub_{int(time.time())}.mp4')
         self.video_inpaint = None
         self.lama_inpaint = None
         self.ext = os.path.splitext(vd_path)[-1]
@@ -613,7 +613,6 @@ class SubtitleRemover:
                 print('Warning: DirectML acceleration is only available for STTN model. Falling back to CPU for other models.')
         for provider in config.ONNX_PROVIDERS:
             print(f"Detected execution provider: {provider}")
-
 
         # 总处理进度
         self.progress_total = 0
@@ -671,6 +670,69 @@ class SubtitleRemover:
         current_percentage = (tbar.n / tbar.total) * 100
         self.progress_remover = int(current_percentage) // 2
         self.progress_total = 50 + self.progress_remover
+
+    def run_with_progress_callback(self, progress_callback):
+        """
+        处理视频并定期调用回调来更新进度
+        """
+        # 记录开始时间
+        start_time = time.time()
+        # 重置进度条
+        self.progress_total = 0
+        tbar = tqdm(total=int(self.frame_count), unit='frame', position=0, file=sys.__stdout__,
+                    desc='Subtitle Removing')
+
+        # 调用不同模式处理视频
+        if self.is_picture:
+            # 处理图片
+            sub_list = self.sub_detector.find_subtitle_frame_no(sub_remover=self)
+            self.lama_inpaint = LamaInpaint()
+            original_frame = cv2.imread(self.video_path)
+            if len(sub_list):
+                mask = create_mask(original_frame.shape[0:2], sub_list[1])
+                inpainted_frame = self.lama_inpaint(original_frame, mask)
+            else:
+                inpainted_frame = original_frame
+            if self.gui_mode:
+                self.preview_frame = cv2.hconcat([original_frame, inpainted_frame])
+            cv2.imencode(self.ext, inpainted_frame)[1].tofile(self.video_out_name)
+            tbar.update(1)
+            self.progress_total = 100
+        else:
+            # 精准模式下，获取场景分割的帧号，进一步切割
+            if config.MODE == config.InpaintMode.PROPAINTER:
+                self.propainter_mode(tbar)
+            elif config.MODE == config.InpaintMode.STTN:
+                self.sttn_mode(tbar)
+            else:
+                self.lama_mode(tbar)
+
+        # 在处理过程中调用进度回调
+        if progress_callback:
+            progress_callback(self.progress_total)
+
+        # 完成视频处理
+        self.video_cap.release()
+        self.video_writer.release()
+        if not self.is_picture:
+            self.merge_audio_to_video()
+            print(f"[Finished] Subtitle successfully removed, video generated at：{self.video_out_name}")
+        else:
+            print(f"[Finished] Subtitle successfully removed, picture generated at：{self.video_out_name}")
+        print(f'time cost: {round(time.time() - start_time, 2)}s')
+        self.isFinished = True
+        self.progress_total = 100
+
+        # 删除临时文件
+        if os.path.exists(self.video_temp_file.name):
+            try:
+                os.remove(self.video_temp_file.name)
+            except Exception:
+                if platform.system() in ['Windows']:
+                    pass
+                else:
+                    print(f'failed to delete temp file {self.video_temp_file.name}')
+        print(f'Processing finished!')
 
     def propainter_mode(self, tbar):
         print('use propainter mode')
@@ -772,6 +834,40 @@ class SubtitleRemover:
         mask = create_mask(self.mask_size, mask_area_coordinates)
         sttn_video_inpaint = STTNVideoInpaint(self.video_path)
         sttn_video_inpaint(input_mask=mask, input_sub_remover=self, tbar=tbar)
+
+    # #     测试字幕区域
+    #     # 获取视频帧尺寸
+    #     video_width, video_height = self.frame_width, self.frame_height
+    #
+    #     # 生成蒙版（这个蒙版应该与输入视频尺寸一致）
+    #     mask = create_mask(self.mask_size, mask_area_coordinates)
+    #
+    #     print(f'Mask Area Coordinates: {mask_area_coordinates}')
+    #
+    #     # 读取视频帧并填充黑色区域
+    #     self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # 从头开始读取视频
+    #     while True:
+    #         ret, frame = self.video_cap.read()
+    #         if not ret:
+    #             break
+    #
+    #         # 用蒙版将字幕区域填充为黑色
+    #         for area in mask_area_coordinates:
+    #             ymin, ymax, xmin, xmax = area
+    #             frame[ymin:ymax, xmin:xmax] = 255  # 将区域内的像素设为白色
+    #
+    #         # 写入修改后的帧
+    #         self.video_writer.write(frame)
+    #
+    #         # 更新进度条
+    #         self.update_progress(tbar, increment=1)
+    #
+    #         if self.gui_mode:
+    #             self.preview_frame = cv2.hconcat([frame, frame])  # 可以展示原始与处理后的对比图
+    #
+    #     print('[Finished] Subtitle areas have been blacked out.')
+
+
 
     def sttn_mode(self, tbar):
         # 是否跳过字幕帧寻找
@@ -972,11 +1068,11 @@ class SubtitleRemover:
 
 if __name__ == '__main__':
     multiprocessing.set_start_method("spawn")
-    # 1. 提示用户输入视频路径
+    # 1. 提示用户输入视频路径（C:\Users\Admin\Pictures\测试视频.mp4）
     video_path = input(f"Please input video or image file path: ").strip()
-    # 判断视频路径是不是一个目录，是目录的化，批量处理改目录下的所有视频文件
-    # 2. 按以下顺序传入字幕区域
-    # sub_area = (ymin, ymax, xmin, xmax)
+    # 判断视频路径是不是一个目录，是目录的话，批量处理改目录下的所有视频文件
+    # 2. 按以下顺序传入字幕区域（ymin ymax xmin xmax ）
+    # sub_area = (967, 1040, 188, 515)
     # 3. 新建字幕提取对象
     if is_video_or_image(video_path):
         sd = SubtitleRemover(video_path, sub_area=None)
